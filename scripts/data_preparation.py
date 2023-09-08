@@ -132,7 +132,15 @@ def create_search_service(
         raise Exception(
             f"Failed to create search service. Error: {response.text}")
 
-def create_or_update_search_index(service_name, subscription_id, resource_group, index_name, semantic_config_name, credential, language):
+def create_or_update_search_index(
+        service_name, 
+        subscription_id, 
+        resource_group, 
+        index_name, 
+        semantic_config_name, 
+        credential, 
+        language,
+        vector_config_name=None):
     if credential is None:
         raise ValueError("credential cannot be None")
     admin_key = json.loads(
@@ -143,7 +151,7 @@ def create_or_update_search_index(service_name, subscription_id, resource_group,
         ).stdout
     )["primaryKey"]
 
-    url = f"https://{service_name}.search.windows.net/indexes/{index_name}?api-version=2021-04-30-Preview"
+    url = f"https://{service_name}.search.windows.net/indexes/{index_name}?api-version=2023-07-01-Preview"
     headers = {
         "Content-Type": "application/json",
         "api-key": admin_key,
@@ -210,6 +218,25 @@ def create_or_update_search_index(service_name, subscription_id, resource_group,
         },
     }
 
+    if vector_config_name:
+        body["fields"].append({
+            "name": "contentVector",
+            "type": "Collection(Edm.Single)",
+            "searchable": True,
+            "retrievable": True,
+            "dimensions": 1536,
+            "vectorSearchConfiguration": "default"
+        })
+
+        body["vectorSearch"] = {
+            "algorithmConfigurations": [
+                {
+                    "name": vector_config_name,
+                    "kind": "hnsw"
+                }
+            ]
+        }
+
     response = requests.put(url, json=body, headers=headers)
     if response.status_code == 201:
         print(f"Created search index {index_name}")
@@ -231,6 +258,8 @@ def upload_documents_to_index(service_name, subscription_id, resource_group, ind
         d = dataclasses.asdict(document)
         # add id to documents
         d.update({"@search.action": "upload", "id": str(id)})
+        if "contentVector" in d and d["contentVector"] is None:
+            del d["contentVector"]
         to_upload_dicts.append(d)
         id += 1
     
@@ -303,7 +332,7 @@ def validate_index(service_name, subscription_id, resource_group, index_name):
                 print(f"Request failed. Please investigate. Status code: {response.status_code}")
             break
 
-def create_index(config, credential, form_recognizer_client=None, use_layout=False, njobs=4):
+def create_index(config, credential, form_recognizer_client=None, embedding_model_endpoint=None, use_layout=False, njobs=4):
     service_name = config["search_service_name"]
     subscription_id = config["subscription_id"]
     resource_group = config["resource_group"]
@@ -326,12 +355,17 @@ def create_index(config, credential, form_recognizer_client=None, use_layout=Fal
         create_search_service(service_name, subscription_id, resource_group, location, credential=credential)
 
     # create or update search index with compatible schema
-    if not create_or_update_search_index(service_name, subscription_id, resource_group, index_name, config["semantic_config_name"], credential, language):
+    if not create_or_update_search_index(service_name, subscription_id, resource_group, index_name, config["semantic_config_name"], credential, language, vector_config_name=config.get("vector_config_name", None)):
         raise Exception(f"Failed to create or update index {index_name}")
     
     # chunk directory
     print("Chunking directory...")
-    result = chunk_directory(config["data_path"], num_tokens=config["chunk_size"], token_overlap=config.get("token_overlap",0), form_recognizer_client=form_recognizer_client, use_layout=use_layout, njobs=njobs)
+    add_embeddings = False
+    if config.get("vector_config_name") and embedding_model_endpoint:
+        add_embeddings = True
+    result = chunk_directory(config["data_path"], num_tokens=config["chunk_size"], token_overlap=config.get("token_overlap",0),
+                             azure_credential=credential, form_recognizer_client=form_recognizer_client, use_layout=use_layout, njobs=njobs,
+                             add_embeddings=add_embeddings, embedding_endpoint=embedding_model_endpoint)
 
     if len(result.chunks) == 0:
         raise Exception("No chunks found. Please check the data path and chunk size.")
@@ -364,6 +398,8 @@ if __name__ == "__main__":
     parser.add_argument("--form-rec-key", type=str, help="Key for your Form Recognizer resource to use for PDF cracking.")
     parser.add_argument("--form-rec-use-layout", default=False, action='store_true', help="Whether to use Layout model for PDF cracking, if False will use Read model.")
     parser.add_argument("--njobs", type=valid_range, default=4, help="Number of jobs to run (between 1 and 32). Default=4")
+    parser.add_argument("--embedding-model-endpoint", type=str, help="Endpoint for the embedding model to use for vector search. Format: 'https://<AOAI resource name>.openai.azure.com/openai/deployments/<Ada deployment name>/embeddings?api-version=2023-03-15-preview'")
+    parser.add_argument("--embedding-model-key", type=str, help="Key for the embedding model to use for vector search.")
     args = parser.parse_args()
 
     with open(args.config) as f:
@@ -382,7 +418,10 @@ if __name__ == "__main__":
 
     for index_config in config:
         print("Preparing data for index:", index_config["index_name"])
-        create_index(index_config, credential, form_recognizer_client, use_layout=args.form_rec_use_layout, njobs=args.njobs)
+        if index_config.get("vector_config_name") and not args.embedding_model_endpoint:
+            raise Exception("ERROR: Vector search is enabled in the config, but no embedding model endpoint and key were provided. Please provide these values or disable vector search.")
+    
+        create_index(index_config, credential, form_recognizer_client, embedding_model_endpoint=args.embedding_model_endpoint, use_layout=args.form_rec_use_layout, njobs=args.njobs)
         print("Data preparation for index", index_config["index_name"], "completed")
 
     print(f"Data preparation script completed. {len(config)} indexes updated.")
